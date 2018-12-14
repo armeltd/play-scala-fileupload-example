@@ -1,31 +1,38 @@
 package controllers
 
 import java.io.File
-import java.nio.file.{Files, Path}
-import javax.inject._
+import java.nio.file.Files
+import java.util.UUID
 
-import akka.stream.IOResult
+import akka.actor.ActorSystem
+import akka.stream.Materializer
+import akka.stream.alpakka.s3.scaladsl.MultipartUploadResult
 import akka.stream.scaladsl._
 import akka.util.ByteString
+import javax.inject._
+import org.talend.dataset.services.localconnection.S3Streamer
 import play.api._
 import play.api.data.Form
 import play.api.data.Forms._
+import play.api.libs.json.Json
 import play.api.libs.streams._
 import play.api.mvc.MultipartFormData.FilePart
 import play.api.mvc._
-import play.core.parsers.Multipart.FileInfo
+import play.core.parsers.Multipart.FilePartHandler
 
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.ExecutionContext
 
 case class FormData(name: String)
 
 /**
- * This controller handles a file upload.
- */
+  * This controller handles a file upload.
+  */
 @Singleton
-class HomeController @Inject() (cc:MessagesControllerComponents)
-                               (implicit executionContext: ExecutionContext)
-  extends MessagesAbstractController(cc) {
+class HomeController @Inject()(cc: MessagesControllerComponents, configuration: Configuration)(
+    implicit executionContext: ExecutionContext,
+    system: ActorSystem,
+    mat: Materializer)
+    extends MessagesAbstractController(cc) {
 
   private val logger = Logger(this.getClass)
 
@@ -36,37 +43,29 @@ class HomeController @Inject() (cc:MessagesControllerComponents)
   )
 
   /**
-   * Renders a start page.
-   */
+    * Renders a start page.
+    */
   def index = Action { implicit request =>
     Ok(views.html.index(form))
   }
 
-  type FilePartHandler[A] = FileInfo => Accumulator[ByteString, FilePart[A]]
-
-  /**
-   * Uses a custom FilePartHandler to return a type of "File" rather than
-   * using Play's TemporaryFile class.  Deletion must happen explicitly on
-   * completion, rather than TemporaryFile (which uses finalization to
-   * delete temporary files).
-   *
-   * @return
-   */
-  private def handleFilePartAsFile: FilePartHandler[File] = {
-    case FileInfo(partName, filename, contentType) =>
-      val path: Path = Files.createTempFile("multipartBody", "tempFile")
-      val fileSink: Sink[ByteString, Future[IOResult]] = FileIO.toPath(path)
-      val accumulator: Accumulator[ByteString, IOResult] = Accumulator(fileSink)
-      accumulator.map {
-        case IOResult(count, status) =>
-          logger.info(s"count = $count, status = $status")
-          FilePart(partName, filename, contentType, path.toFile)
-      }
+   val filePartHandler: FilePartHandler[MultipartUploadResult] = info => {
+    logger.debug("in filepart handler")
+    val fileId = UUID.randomUUID
+    val streamer = new S3Streamer(configuration)
+    val sink = streamer.sink(fileId.toString)
+    val chunkLogger = Flow[ByteString].map { chunk =>
+      logger.debug(s"Chunk uploaded to S3 for file $fileId - size = ${chunk.size}")
+      chunk
+    }
+    Accumulator(sink)
+      .through(chunkLogger)
+      .map(result => FilePart(s"$fileId", info.fileName, info.contentType, result))
   }
 
   /**
-   * A generic operation on the temporary file that deletes the temp file after completion.
-   */
+    * A generic operation on the temporary file that deletes the temp file after completion.
+    */
   private def operateOnTempFile(file: File) = {
     val size = Files.size(file.toPath)
     logger.info(s"size = ${size}")
@@ -75,19 +74,16 @@ class HomeController @Inject() (cc:MessagesControllerComponents)
   }
 
   /**
-   * Uploads a multipart file as a POST request.
-   *
-   * @return
-   */
-  def upload = Action(parse.multipartFormData(handleFilePartAsFile)) { implicit request =>
-    val fileOption = request.body.file("name").map {
-      case FilePart(key, filename, contentType, file) =>
-        logger.info(s"key = ${key}, filename = ${filename}, contentType = ${contentType}, file = $file")
-        val data = operateOnTempFile(file)
-        data
-    }
-
-    Ok(s"file size = ${fileOption.getOrElse("no file")}")
+    * Uploads a multipart file as a POST request.
+    *
+    * @return
+    */
+  def upload = Action(parse.multipartFormData(filePartHandler)) {
+    implicit request =>
+      request.body.files.headOption match {
+        case None => Ok(Json.obj("fileId" -> "not found"))
+        case Some(file) => Ok(Json.obj("fileId" -> file.key))
+      }
   }
 
 }
